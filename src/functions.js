@@ -1262,7 +1262,7 @@ async function show_open_project_modal() {
 					</div>
 				`;
 			}
-			projectsHTML += '</div>';
+			projectsHTML += "</div>";
 
 			$w.$main.find(".project-list-container").html(projectsHTML);
 
@@ -1272,7 +1272,7 @@ async function show_open_project_modal() {
 					return; // Don't open if delete button was clicked
 				}
 
-				const projectId = $(this).data("project-id");
+				const projectId = $(e.currentTarget).data("project-id");
 				try {
 					$w.$main.find(".project-list-container").html(`
 						<div class="loading-state">
@@ -1290,23 +1290,24 @@ async function show_open_project_modal() {
 			});
 
 			// Handle project deletion
-			$w.$main.find(".delete-project-btn").on("click", async function (e) {
+			$w.$main.find(".delete-project-btn").on("click", async (e) => {
 				e.stopPropagation();
-				const projectId = $(this).data("project-id");
-				const projectName = $(this).closest(".project-item").find(".project-name").text();
+				const $btn = $(e.currentTarget);
+				const projectId = $btn.data("project-id");
+				const projectName = $btn.closest(".project-item").find(".project-name").text();
 
 				const result = await showMessageBox({
 					message: localize("Are you sure you want to delete \"%1\"?", projectName),
 					buttons: [
 						{ label: localize("Yes"), value: "yes", default: false },
-						{ label: localize("No"), value: "no", default: true }
+						{ label: localize("No"), value: "no", default: true },
 					],
 				});
 
 				if (result === "yes") {
 					try {
 						await deleteProject(projectId);
-						$(this).closest(".project-item").remove();
+						$btn.closest(".project-item").remove();
 
 						if ($w.$main.find(".project-item").length === 0) {
 							$w.$main.find(".project-list-container").html(`
@@ -1346,33 +1347,29 @@ async function show_open_project_modal() {
  * @param {any} project
  */
 async function open_project_from_cloud(project) {
-	try {
-		// Fetch the image from the URL
-		const response = await fetch(project.imageUrl);
-		if (!response.ok) {
-			throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
-		}
-		const blob = await response.blob();
-
-		const info = await new Promise((resolve, reject) => {
-			read_image_file(blob, (error, info) => {
-				if (error) {
-					reject(error);
-				} else {
-					resolve(info);
-				}
-			});
-		});
-
-		open_from_image_info(info, () => {
-			current_project_id = project.id;
-			file_name = project.name;
-			saved = true;
-			update_title();
-		});
-	} catch (error) {
-		throw error;
+	// Fetch the image from the URL
+	const response = await fetch(project.imageUrl);
+	if (!response.ok) {
+		throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
 	}
+	const blob = await response.blob();
+
+	const info = await new Promise((resolve, reject) => {
+		read_image_file(blob, (error, info) => {
+			if (error) {
+				reject(error);
+			} else {
+				resolve(info);
+			}
+		});
+	});
+
+	open_from_image_info(info, () => {
+		current_project_id = project.id;
+		file_name = project.name;
+		saved = true;
+		update_title();
+	});
 }
 
 /**
@@ -1486,7 +1483,7 @@ async function file_save_to_cloud(saveAs = false) {
 }
 
 
-function file_save(maybe_saved_callback = () => { }, update_from_saved = true) {
+function file_save(maybe_saved_callback = () => { }) {
 	// Check if user is authenticated for cloud storage
 	if (isAuthenticated()) {
 		// Always use cloud save when authenticated
@@ -1517,7 +1514,7 @@ function file_save(maybe_saved_callback = () => { }, update_from_saved = true) {
 	})();
 }
 
-function file_save_as(maybe_saved_callback = () => { }, update_from_saved = true) {
+function file_save_as(maybe_saved_callback = () => { }) {
 	// Check if user is authenticated for cloud storage
 	if (isAuthenticated()) {
 		// Always use cloud save with "Save As" mode when authenticated
@@ -1594,7 +1591,7 @@ function are_you_sure(action, canceled, from_session_load) {
 			if (result === "save") {
 				file_save(() => {
 					action();
-				}, false);
+				});
 			} else if (result === "discard") {
 				action({ canvas_modified_while_loading: true });
 			} else {
@@ -1630,7 +1627,7 @@ function are_you_sure(action, canceled, from_session_load) {
 			if (result === "save") {
 				file_save(() => {
 					action();
-				}, false);
+				});
 			} else if (result === "discard") {
 				action();
 			} else {
@@ -3087,7 +3084,7 @@ function view_bitmap() {
 			document.removeEventListener("contextmenu", onContextMenu);
 		}, 100);
 		URL.revokeObjectURL(blob_url);
-		clearInterval(iid);
+		clearInterval(Number(iid));
 		if (document.fullscreenElement === bitmap_view_div || document.webkitFullscreenElement === bitmap_view_div) {
 			if (document.exitFullscreen) {
 				document.exitFullscreen(); // avoid warning in Firefox
