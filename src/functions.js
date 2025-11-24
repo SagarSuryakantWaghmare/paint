@@ -8,6 +8,7 @@ import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
 // import { localize } from "./app-localization.js";
+import { createProject, deleteProject, getAllProjects, getPresignedUploadUrl, getProjectById, isAuthenticated, requestAuthFromParent, updateProject, uploadToS3 } from "./api-client.js";
 import { default_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
 import { $G, E, TAU, debounce, from_canvas_coords, get_help_folder_icon, get_icon_for_tool, get_rgba_from_color, is_discord_embed, is_pride_month, make_canvas, render_access_key, to_canvas_coords } from "./helpers.js";
@@ -1084,6 +1085,9 @@ function load_theme_from_text(fileText) {
 	$G.triggerHandler("theme-load");
 }
 
+// Track current project ID for cloud save/load
+let current_project_id = null;
+
 function file_new() {
 	are_you_sure(() => {
 		deselect();
@@ -1097,13 +1101,41 @@ function file_new() {
 		reset_canvas_and_history(); // (with newly reset colors)
 		set_magnification(default_magnification);
 
+		// Reset project ID for new file
+		current_project_id = null;
+
 		$G.triggerHandler("session-update"); // autosave
 	});
 }
 
 async function file_open() {
-	const { file, fileHandle } = await systemHooks.showOpenFileDialog({ formats: image_formats });
-	open_from_file(file, fileHandle);
+	// Check if user is authenticated for cloud storage
+	if (isAuthenticated()) {
+		// Always show cloud project modal when authenticated
+		try {
+			await show_open_project_modal();
+		} catch (error) {
+			console.error("Failed to open project modal:", error);
+			show_error_message("Failed to load projects. Please try again.", error);
+		}
+		return;
+	}
+
+	// If not authenticated, prompt the user to log in instead of falling back to local file picker
+	const { promise } = showMessageBox({
+		message: localize("You must be logged in to open cloud projects. Log in now?"),
+		buttons: [
+			{ label: localize("Log in"), value: "login" },
+			{ label: localize("Cancel"), value: "cancel", default: true },
+		],
+	});
+
+	const choice = await (promise ? promise : Promise.resolve(null));
+	if (choice === "login") {
+		// If running in an iframe, this will request auth from the parent; otherwise, it will warn
+		requestAuthFromParent();
+	}
+	return;
 }
 
 /** @type {OSGUI$Window} */
@@ -1187,64 +1219,333 @@ async function confirm_overwrite_capability() {
 	return false;
 }
 
+/**
+ * Show modal to open a project from cloud storage
+ */
+async function show_open_project_modal() {
+	const $w = $DialogWindow(localize("Open Project"));
+	$w.addClass("open-project-modal");
 
-function file_save(maybe_saved_callback = () => { }, update_from_saved = true) {
-	deselect();
-	// store and use file handle at this point in time, to avoid race conditions
-	const save_file_handle = system_file_handle;
-	if (!save_file_handle || file_name.match(/\.(svg|pdf)$/i)) {
-		return file_save_as(maybe_saved_callback, update_from_saved);
+	$w.$main.html(`
+		<div class="project-list-container">
+			<div class="loading-state">
+				<p>${localize("Loading projects...")}</p>
+			</div>
+		</div>
+	`);
+
+	$w.$main.css({ maxWidth: "600px", maxHeight: "500px", overflow: "auto" });
+
+	try {
+		const projects = await getAllProjects();
+
+		if (projects.length === 0) {
+			$w.$main.find(".project-list-container").html(`
+				<div class="empty-state">
+					<p>${localize("No projects found. Create your first project!")}</p>
+				</div>
+			`);
+		} else {
+			let projectsHTML = '<div class="projects-grid">';
+
+			for (const project of projects) {
+				const thumbnailUrl = project.thumbnailUrl || project.imageUrl || "";
+				const projectName = (project.name || "Untitled").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+				const projectDate = new Date(project.updatedAt || project.createdAt).toLocaleDateString();
+
+				projectsHTML += `
+					<div class="project-item" data-project-id="${project.id}">
+						<img class="project-thumbnail" src="${thumbnailUrl}" alt="${projectName}" loading="lazy">
+						<p class="project-name" title="${projectName}">${projectName}</p>
+						<p class="project-date">${projectDate}</p>
+						<button class="delete-project-btn" data-project-id="${project.id}" title="${localize("Delete")}">×</button>
+					</div>
+				`;
+			}
+			projectsHTML += '</div>';
+
+			$w.$main.find(".project-list-container").html(projectsHTML);
+
+			// Handle project selection
+			$w.$main.find(".project-item").on("click", async function (e) {
+				if ($(e.target).hasClass("delete-project-btn")) {
+					return; // Don't open if delete button was clicked
+				}
+
+				const projectId = $(this).data("project-id");
+				try {
+					$w.$main.find(".project-list-container").html(`
+						<div class="loading-state">
+							<p>${localize("Loading project...")}</p>
+						</div>
+					`);
+
+					const project = await getProjectById(projectId);
+					await open_project_from_cloud(project);
+					$w.close();
+				} catch (error) {
+					show_error_message(localize("Failed to open project"), error);
+					$w.close();
+				}
+			});
+
+			// Handle project deletion
+			$w.$main.find(".delete-project-btn").on("click", async function (e) {
+				e.stopPropagation();
+				const projectId = $(this).data("project-id");
+				const projectName = $(this).closest(".project-item").find(".project-name").text();
+
+				const result = await showMessageBox({
+					message: localize("Are you sure you want to delete \"%1\"?", projectName),
+					buttons: [
+						{ label: localize("Yes"), value: "yes", default: false },
+						{ label: localize("No"), value: "no", default: true }
+					],
+				});
+
+				if (result === "yes") {
+					try {
+						await deleteProject(projectId);
+						$(this).closest(".project-item").remove();
+
+						if ($w.$main.find(".project-item").length === 0) {
+							$w.$main.find(".project-list-container").html(`
+								<div class="empty-state">
+									<p>${localize("No projects found. Create your first project!")}</p>
+								</div>
+							`);
+						}
+					} catch (error) {
+						show_error_message(localize("Failed to delete project"), error);
+					}
+				}
+			});
+		}
+	} catch (error) {
+		if (error.message && error.message.includes("401")) {
+			$w.$main.find(".project-list-container").html(`
+				<div class="auth-required-message">
+					<p>${localize("Please log in to access your projects.")}</p>
+				</div>
+			`);
+		} else {
+			show_error_message(localize("Failed to load projects"), error);
+			$w.close();
+		}
 	}
-	write_image_file(main_canvas, file_format, async (blob) => {
-		// An error may be shown by `systemHooks.writeBlobToHandle`,
-		// or it may be unknown whether the save will succeed,
-		// so for now: true means definite success, false means failure or cancelation, and undefined means it's unknown.
-		const success = await systemHooks.writeBlobToHandle(save_file_handle, blob);
-		// When using a file download, where it's unknown whether the save will succeed,
-		// we don't want to mark the file as saved, as it would prevent the user from retrying the save.
-		// So only mark the file as saved if it's definite.
-		if (success === true) {
+
+	$w.$Button(localize("Cancel"), () => {
+		$w.close();
+	});
+
+	$w.center();
+}
+
+/**
+ * Open a project from cloud storage data
+ * @param {any} project
+ */
+async function open_project_from_cloud(project) {
+	try {
+		// Fetch the image from the URL
+		const response = await fetch(project.imageUrl);
+		if (!response.ok) {
+			throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+		}
+		const blob = await response.blob();
+
+		const info = await new Promise((resolve, reject) => {
+			read_image_file(blob, (error, info) => {
+				if (error) {
+					reject(error);
+				} else {
+					resolve(info);
+				}
+			});
+		});
+
+		open_from_image_info(info, () => {
+			current_project_id = project.id;
+			file_name = project.name;
 			saved = true;
 			update_title();
+		});
+	} catch (error) {
+		throw error;
+	}
+}
+
+/**
+ * Save file to cloud storage
+ * @param {boolean} saveAs - Whether to prompt for new name
+ */
+async function file_save_to_cloud(saveAs = false) {
+	deselect();
+
+	if (!isAuthenticated()) {
+		show_error_message(localize("Please log in to save your project."));
+		return;
+	}
+
+	let projectName = file_name;
+	let projectFormat = file_format;
+
+	if (saveAs || !current_project_id) {
+		try {
+			const result = await save_as_prompt({
+				dialogTitle: localize("Save Project"),
+				defaultFileName: file_name,
+				defaultFileFormatID: file_format,
+				formats: image_formats,
+			});
+			projectName = result.newFileName;
+			projectFormat = result.newFileFormatID;
+		} catch {
+			return; // User cancelled
 		}
-		// However, we can still apply format-specific color reduction to the canvas,
-		// and call the "maybe saved" callback, which, as the name implies, is intended to handle the uncertainty.
-		if (success !== false) {
-			if (update_from_saved) {
-				update_from_saved_file(blob);
-			}
-			maybe_saved_callback();
-		}
+	}
+
+	const $progress = showMessageBox({
+		message: localize("Saving project..."),
+		buttons: [],
 	});
+	$progress.$window.addClass("progress-modal");
+
+	try {
+		// Convert canvas to blob
+		const blob = await new Promise((resolve) => {
+			write_image_file(main_canvas, projectFormat, resolve);
+		});
+
+		// Create file from blob
+		const file = new File([blob], projectName, { type: projectFormat });
+
+		// Get presigned URL for upload
+		const { uploadUrl, fileKey, imageUrl } = await getPresignedUploadUrl(projectName, projectFormat);
+
+		// Upload to S3
+		const uploadResult = await uploadToS3(file, uploadUrl);
+
+		if (!uploadResult.status) {
+			throw new Error(localize("Failed to upload image to storage"));
+		}
+
+		// Prepare form data for backend
+		const formData = new FormData();
+		formData.append("name", projectName);
+		formData.append("fileKey", fileKey);
+		formData.append("imageUrl", imageUrl);
+		formData.append("fileFormat", projectFormat);
+		formData.append("width", main_canvas.width.toString());
+		formData.append("height", main_canvas.height.toString());
+
+		// Create thumbnail
+		const thumbnailSize = 200;
+		const thumbnailCanvas = make_canvas(
+			Math.min(thumbnailSize, main_canvas.width),
+			Math.min(thumbnailSize, main_canvas.height)
+		);
+		const scale = Math.min(
+			thumbnailSize / main_canvas.width,
+			thumbnailSize / main_canvas.height
+		);
+		thumbnailCanvas.width = Math.floor(main_canvas.width * scale);
+		thumbnailCanvas.height = Math.floor(main_canvas.height * scale);
+		thumbnailCanvas.ctx.drawImage(main_canvas, 0, 0, thumbnailCanvas.width, thumbnailCanvas.height);
+
+		const thumbnailBlob = await new Promise((resolve) => {
+			write_image_file(thumbnailCanvas, "image/png", resolve);
+		});
+		const thumbnailFile = new File([thumbnailBlob], `thumb_${projectName}.png`, { type: "image/png" });
+		formData.append("thumbnail", thumbnailFile);
+
+		// Save or update project
+		let result;
+		if (current_project_id && !saveAs) {
+			result = await updateProject(current_project_id, formData);
+		} else {
+			result = await createProject(formData);
+			current_project_id = result.id;
+		}
+
+		file_name = projectName;
+		file_format = projectFormat;
+		saved = true;
+		update_title();
+
+		$progress.$window.close();
+		showMessageBox({
+			message: localize("Project saved successfully!"),
+			iconID: "info",
+		});
+
+	} catch (error) {
+		$progress.$window.close();
+		show_error_message(localize("Failed to save project"), error);
+	}
+}
+
+
+function file_save(maybe_saved_callback = () => { }, update_from_saved = true) {
+	// Check if user is authenticated for cloud storage
+	if (isAuthenticated()) {
+		// Always use cloud save when authenticated
+		file_save_to_cloud(false).then(() => {
+			maybe_saved_callback();
+		}).catch((error) => {
+			console.error("Cloud save failed:", error);
+			show_error_message("Failed to save to cloud. Please try again.", error);
+		});
+		return;
+	}
+
+	// Fallback to local file save when not authenticated
+	// When not authenticated, prompt user to log in instead of falling back to local download
+	const { promise } = showMessageBox({
+		message: localize("You must be logged in to save projects to the cloud. Log in now?"),
+		buttons: [
+			{ label: localize("Log in"), value: "login" },
+			{ label: localize("Cancel"), value: "cancel", default: true },
+		],
+	});
+
+	(async () => {
+		const choice = await (promise ? promise : Promise.resolve(null));
+		if (choice === "login") {
+			requestAuthFromParent();
+		}
+	})();
 }
 
 function file_save_as(maybe_saved_callback = () => { }, update_from_saved = true) {
-	deselect();
-	systemHooks.showSaveFileDialog({
-		dialogTitle: localize("Save As"),
-		formats: image_formats,
-		defaultFileName: file_name,
-		defaultPath: typeof system_file_handle === "string" ? system_file_handle : null,
-		defaultFileFormatID: file_format,
-		getBlob: (new_file_type) => {
-			return new Promise((resolve) => {
-				write_image_file(main_canvas, new_file_type, (blob) => {
-					resolve(blob);
-				});
-			});
-		},
-		savedCallbackUnreliable: ({ newFileName, newFileFormatID, newFileHandle, newBlob }) => {
-			saved = true;
-			system_file_handle = newFileHandle;
-			file_name = newFileName;
-			file_format = newFileFormatID;
-			update_title();
+	// Check if user is authenticated for cloud storage
+	if (isAuthenticated()) {
+		// Always use cloud save with "Save As" mode when authenticated
+		file_save_to_cloud(true).then(() => {
 			maybe_saved_callback();
-			if (update_from_saved) {
-				update_from_saved_file(newBlob);
-			}
-		},
+		}).catch((error) => {
+			console.error("Cloud save as failed:", error);
+			show_error_message("Failed to save to cloud. Please try again.", error);
+		});
+		return;
+	}
+
+	// Fallback to local file save when not authenticated
+	// When not authenticated, prompt the user to log in instead of opening the save dialog
+	const { promise } = showMessageBox({
+		message: localize("You must be logged in to save projects to the cloud. Log in now?"),
+		buttons: [
+			{ label: localize("Log in"), value: "login" },
+			{ label: localize("Cancel"), value: "cancel", default: true },
+		],
 	});
+
+	(async () => {
+		const choice = await (promise ? promise : Promise.resolve(null));
+		if (choice === "login") {
+			requestAuthFromParent();
+		}
+	})();
 }
 
 function file_print() {
@@ -4224,8 +4525,8 @@ export {
 	$this_version_news,
 	apply_file_format_and_palette_info, are_you_sure, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
 	edit_copy, edit_cut, edit_paste, exit_fullscreen_if_ios, file_load_from_url, file_new, file_open, file_print, file_save,
-	file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
-	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
+	file_save_as, file_save_to_cloud, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
+	meld_textbox_into_canvas, open_from_file, open_from_image_info, open_project_from_cloud, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_open_project_modal, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
 	toggle_thumbnail, try_exec_command, undo, undoable, update_canvas_rect, update_css_classes_for_conditional_messages, update_disable_aa, update_from_saved_file, update_helper_layer,
 	update_helper_layer_immediately, update_magnified_canvas_size, update_title, view_bitmap, write_image_file
 };
