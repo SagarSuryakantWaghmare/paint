@@ -8,7 +8,7 @@ import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
 // import { localize } from "./app-localization.js";
-import { createProject, deleteProject, getAllProjects, getPresignedUploadUrl, getProjectById, isAuthenticated, requestAuthFromParent, updateProject, uploadToS3 } from "./api-client.js";
+import { createProject, deleteProject, getAllProjects, getPresignedUploadUrl, getProjectById, isAuthenticated, updateProject, uploadToS3 } from "./api-client.js";
 import { default_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
 import { $G, E, TAU, debounce, from_canvas_coords, get_help_folder_icon, get_icon_for_tool, get_rgba_from_color, is_discord_embed, is_pride_month, make_canvas, render_access_key, to_canvas_coords } from "./helpers.js";
@@ -1109,33 +1109,17 @@ function file_new() {
 }
 
 async function file_open() {
-	// Check if user is authenticated for cloud storage
-	if (isAuthenticated()) {
-		// Always show cloud project modal when authenticated
-		try {
-			await show_open_project_modal();
-		} catch (error) {
-			console.error("Failed to open project modal:", error);
+	// Show cloud project modal
+	try {
+		await show_open_project_modal();
+	} catch (error) {
+		console.error("Failed to open project modal:", error);
+		if (error.message && error.message.includes("401")) {
+			show_error_message("Authentication required. Please refresh the page.");
+		} else {
 			show_error_message("Failed to load projects. Please try again.", error);
 		}
-		return;
 	}
-
-	// If not authenticated, prompt the user to log in instead of falling back to local file picker
-	const { promise } = showMessageBox({
-		message: localize("You must be logged in to open cloud projects. Log in now?"),
-		buttons: [
-			{ label: localize("Log in"), value: "login" },
-			{ label: localize("Cancel"), value: "cancel", default: true },
-		],
-	});
-
-	const choice = await (promise ? promise : Promise.resolve(null));
-	if (choice === "login") {
-		// If running in an iframe, this will request auth from the parent; otherwise, it will warn
-		requestAuthFromParent();
-	}
-	return;
 }
 
 /** @type {OSGUI$Window} */
@@ -1484,65 +1468,31 @@ async function file_save_to_cloud(saveAs = false) {
 
 
 function file_save(maybe_saved_callback = () => { }) {
-	// Check if user is authenticated for cloud storage
-	if (isAuthenticated()) {
-		// Always use cloud save when authenticated
-		file_save_to_cloud(false).then(() => {
-			maybe_saved_callback();
-		}).catch((error) => {
-			console.error("Cloud save failed:", error);
+	// Use cloud save
+	file_save_to_cloud(false).then(() => {
+		maybe_saved_callback();
+	}).catch((error) => {
+		console.error("Cloud save failed:", error);
+		if (error.message && error.message.includes("401")) {
+			show_error_message("Authentication required. Please refresh the page.");
+		} else {
 			show_error_message("Failed to save to cloud. Please try again.", error);
-		});
-		return;
-	}
-
-	// Fallback to local file save when not authenticated
-	// When not authenticated, prompt user to log in instead of falling back to local download
-	const { promise } = showMessageBox({
-		message: localize("You must be logged in to save projects to the cloud. Log in now?"),
-		buttons: [
-			{ label: localize("Log in"), value: "login" },
-			{ label: localize("Cancel"), value: "cancel", default: true },
-		],
-	});
-
-	(async () => {
-		const choice = await (promise ? promise : Promise.resolve(null));
-		if (choice === "login") {
-			requestAuthFromParent();
 		}
-	})();
+	});
 }
 
 function file_save_as(maybe_saved_callback = () => { }) {
-	// Check if user is authenticated for cloud storage
-	if (isAuthenticated()) {
-		// Always use cloud save with "Save As" mode when authenticated
-		file_save_to_cloud(true).then(() => {
-			maybe_saved_callback();
-		}).catch((error) => {
-			console.error("Cloud save as failed:", error);
+	// Use cloud save with "Save As" mode
+	file_save_to_cloud(true).then(() => {
+		maybe_saved_callback();
+	}).catch((error) => {
+		console.error("Cloud save as failed:", error);
+		if (error.message && error.message.includes("401")) {
+			show_error_message("Authentication required. Please refresh the page.");
+		} else {
 			show_error_message("Failed to save to cloud. Please try again.", error);
-		});
-		return;
-	}
-
-	// Fallback to local file save when not authenticated
-	// When not authenticated, prompt the user to log in instead of opening the save dialog
-	const { promise } = showMessageBox({
-		message: localize("You must be logged in to save projects to the cloud. Log in now?"),
-		buttons: [
-			{ label: localize("Log in"), value: "login" },
-			{ label: localize("Cancel"), value: "cancel", default: true },
-		],
-	});
-
-	(async () => {
-		const choice = await (promise ? promise : Promise.resolve(null));
-		if (choice === "login") {
-			requestAuthFromParent();
 		}
-	})();
+	});
 }
 
 function file_print() {
